@@ -1,7 +1,7 @@
 # 💰 Automated Cost Governance on AWS (Cost Optimization Pillar)
 
 ## 📌 Project Overview
-This Terraform-based project demonstrates **automated cost governance and optimization** using AWS native services. It deploys intentionally wasteful infrastructure, monitors costs in real-time, and automatically cleans up resources through automated script with approval workflow. The system showcases cost management patterns with event-driven automation, least-privilege security access and Terraform (Infrastructure as Code).
+This Terraform-based project demonstrates **automated cost governance and optimization** using AWS native services. It deploys intentionally wasteful infrastructure, monitors costs in real-time, and automatically cleans up resources through automated script with approval workflow. The system showcases cost optimization patterns with event-driven automation, least-privilege security access and Terraform (Infrastructure as Code).
 
 ⚠️ **Note:** This project requires manual approval via **AWS Console** or **AWS CLI**. Email-only approval can be implemented using AWS Lambda with SNS triggers which is not implemented in this project.
 
