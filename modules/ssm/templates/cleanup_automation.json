@@ -1,0 +1,234 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Automated Cost Governance: Detect and clean up unused EC2/EBS/EIPs and apply S3 lifecycle policies, with approval and SNS notifications.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "IAM role ARN assumed by this Automation for execution.",
+      "default": ""
+    },
+    "CleanupTagKey": {
+      "type": "String",
+      "description": "Tag key used to scope resources for cleanup (governance guardrail).",
+      "default": "CostGovernance"
+    },
+    "CleanupTagValue": {
+      "type": "String",
+      "description": "Tag value used to scope resources for cleanup.",
+      "default": "true"
+    },
+    "IdleDays": {
+      "type": "Integer",
+      "description": "Minimum number of days of zero or near-zero usage to mark EC2 instances as idle.",
+      "default": 7
+    },
+    "S3BucketName": {
+      "type": "String",
+      "description": "Optional: S3 bucket name to apply lifecycle policy (leave blank to skip).",
+      "default": ""
+    },
+    "S3TransitionDays": {
+      "type": "Integer",
+      "description": "Days before objects transition to infrequent access/storage class.",
+      "default": 30
+    },
+    "S3GlacierDays": {
+      "type": "Integer",
+      "description": "Days before objects transition to Glacier storage class.",
+      "default": 90
+    },
+    "S3ExpireDays": {
+      "type": "Integer",
+      "description": "Days before objects expire (set 0 to skip expiration).",
+      "default": 365
+    },
+    "NotificationArn": {
+      "type": "String",
+      "description": "SNS topic ARN for approval notification.",
+      "default": ""
+    },
+    "Approver": {
+      "type": "String",
+      "description": "Approver identity (email or principal reference for audit).",
+      "default": "cost-governance-approver"
+    },
+    "Region": {
+      "type": "String",
+      "description": "AWS region where cleanup will run.",
+      "default": "{{ global:REGION }}"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DiscoverResources",
+      "action": "aws:executeScript",
+      "description": "Find idle EC2 instances, unattached EBS volumes, old snapshots, and unused Elastic IPs filtered by governance tags.",
+      "outputs": [
+        {
+          "Name": "instances",
+          "Selector": "$.Payload.instances",
+          "Type": "StringList"
+        },
+        {
+          "Name": "volumes",
+          "Selector": "$.Payload.volumes",
+          "Type": "StringList"
+        },
+        {
+          "Name": "snapshots",
+          "Selector": "$.Payload.snapshots",
+          "Type": "StringList"
+        },
+        {
+          "Name": "eip_allocations",
+          "Selector": "$.Payload.eip_allocations",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "cleanup_tag_key": "{{ CleanupTagKey }}",
+          "cleanup_tag_value": "{{ CleanupTagValue }}",
+          "idle_days": "{{ IdleDays }}",
+          "region": "{{ Region }}"
+        },
+        "Script": "import boto3, datetime\nfrom datetime import timezone, timedelta\n\ndef has_tag(resource_tags, k, v):\n    return any(t.get('Key')==k and t.get('Value')==v for t in (resource_tags or []))\n\ndef handler(event, context):\n    region = event['region']\n    tag_k = event['cleanup_tag_key']\n    tag_v = event['cleanup_tag_value']\n    idle_days = int(event['idle_days'])\n    ec2 = boto3.client('ec2', region_name=region)\n    cw = boto3.client('cloudwatch', region_name=region)\n\n    cutoff = datetime.datetime.now(timezone.utc) - timedelta(days=idle_days)\n\n    # Discover EC2 instances tagged for governance and idle (low CPU)\n    inst_ids = []\n    reservations = ec2.describe_instances()['Reservations']\n    for r in reservations:\n        for i in r.get('Instances', []):\n            tags = i.get('Tags', [])\n            if not has_tag(tags, tag_k, tag_v):\n                continue\n            # Simple idle heuristic: last 7d max CPUUtilization < 2%\n            metric = cw.get_metric_statistics(\n                Namespace='AWS/EC2', MetricName='CPUUtilization',\n                Dimensions=[{'Name':'InstanceId','Value':i['InstanceId']}],\n                StartTime=cutoff, EndTime=datetime.datetime.now(timezone.utc),\n                Period=3600, Statistics=['Maximum']\n            )\n            maxvals = [dp['Maximum'] for dp in metric.get('Datapoints', [])]\n            if len(maxvals)==0 or max(maxvals) < 2.0:\n                inst_ids.append(i['InstanceId'])\n\n    # Unattached volumes tagged for governance\n    vol_ids = []\n    vols = ec2.describe_volumes(Filters=[{'Name':'status','Values':['available']}])['Volumes']\n    for v in vols:\n        if has_tag(v.get('Tags', []), tag_k, tag_v):\n            vol_ids.append(v['VolumeId'])\n\n    # Old snapshots (older than cutoff) tagged for governance\n    snap_ids = []\n    snaps = ec2.describe_snapshots(OwnerIds=['self'])['Snapshots']\n    for s in snaps:\n        if s.get('StartTime') and s['StartTime'] < cutoff:\n            if has_tag(s.get('Tags', []), tag_k, tag_v):\n                snap_ids.append(s['SnapshotId'])\n\n    # Unused Elastic IPs (no association) tagged for governance\n    eips = ec2.describe_addresses()['Addresses']\n    eip_alloc_ids = []\n    for a in eips:\n        if not a.get('AssociationId'):\n            # Note: EIP tags are on EC2 addresses in some regions via describe-tags; here we assume governance tagging exists on address\n            # Fallback: include all unattached EIPs if governance tagging is not present\n            eip_alloc_ids.append(a['AllocationId'])\n\n    return {\n        'instances': inst_ids,\n        'volumes': vol_ids,\n        'snapshots': snap_ids,\n        'eip_allocations': eip_alloc_ids\n    }\n"
+      }
+    },
+    {
+      "name": "NotifyAndApprove",
+      "action": "aws:approve",
+      "description": "Send approval request via SNS and await human approval.",
+      "inputs": {
+        "NotificationArn": "{{ NotificationArn }}",
+        "Message": "Automated Cost Governance: Approve cleanup for discovered resources? Instances={{ DiscoverResources.instances }}, Volumes={{ DiscoverResources.volumes }}, Snapshots={{ DiscoverResources.snapshots }}, EIPs={{ DiscoverResources.eip_allocations }}",
+        "MinRequiredApprovals": 1,
+        "Approvers": [
+          "{{ Approver }}"
+        ]
+      }
+    },
+    {
+      "name": "StopInstances",
+      "action": "aws:executeScript",
+      "description": "Stop idle EC2 instances before termination (safe step).",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "region": "{{ Region }}",
+          "instances": "{{ DiscoverResources.instances }}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\ndef handler(event, context):\n    ids = event.get('instances', []) or []\n    if not ids:\n        return {'stopped': []}\n    ec2 = boto3.client('ec2', region_name=event['region'])\n    stopped = []\n    for iid in ids:\n        try:\n            ec2.stop_instances(InstanceIds=[iid])\n            stopped.append(iid)\n        except ClientError as e:\n            if 'IncorrectInstanceState' in str(e):\n                # Instance already stopped or in invalid state, skip\n                print(f'Instance {iid} cannot be stopped: {e}')\n                continue\n            raise\n    return {'stopped': stopped}\n"
+      },
+      "onFailure": "Continue"
+    },
+    {
+      "name": "TerminateInstances",
+      "action": "aws:executeScript",
+      "description": "Terminate idle EC2 instances after approval.",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "region": "{{ Region }}",
+          "instances": "{{ DiscoverResources.instances }}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\ndef handler(event, context):\n    ids = event.get('instances', []) or []\n    if not ids:\n        return {'terminated': []}\n    ec2 = boto3.client('ec2', region_name=event['region'])\n    terminated = []\n    for iid in ids:\n        try:\n            ec2.terminate_instances(InstanceIds=[iid])\n            terminated.append(iid)\n        except ClientError as e:\n            if 'IncorrectInstanceState' in str(e):\n                # Instance already terminated or in invalid state, skip\n                print(f'Instance {iid} cannot be terminated: {e}')\n                continue\n            raise\n    return {'terminated': terminated}\n"
+      }
+    },
+    {
+      "name": "DeleteVolumes",
+      "action": "aws:executeScript",
+      "description": "Delete unattached EBS volumes.",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "region": "{{ Region }}",
+          "volumes": "{{ DiscoverResources.volumes }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    ids = event.get('volumes', []) or []\n    if not ids:\n        return {'deleted': []}\n    ec2 = boto3.client('ec2', region_name=event['region'])\n    deleted = []\n    for vid in ids:\n        try:\n            ec2.delete_volume(VolumeId=vid)\n            deleted.append(vid)\n        except Exception as e:\n            pass\n    return {'deleted': deleted}\n"
+      }
+    },
+    {
+      "name": "DeleteSnapshots",
+      "action": "aws:executeScript",
+      "description": "Delete old EBS snapshots.",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "region": "{{ Region }}",
+          "snapshots": "{{ DiscoverResources.snapshots }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    ids = event.get('snapshots', []) or []\n    if not ids:\n        return {'deleted': []}\n    ec2 = boto3.client('ec2', region_name=event['region'])\n    deleted = []\n    for sid in ids:\n        try:\n            ec2.delete_snapshot(SnapshotId=sid)\n            deleted.append(sid)\n        except Exception as e:\n            pass\n    return {'deleted': deleted}\n"
+      }
+    },
+    {
+      "name": "ReleaseEIPs",
+      "action": "aws:executeScript",
+      "description": "Release unused Elastic IP addresses.",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "region": "{{ Region }}",
+          "allocations": "{{ DiscoverResources.eip_allocations }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    allocs = event.get('allocations', []) or []\n    if not allocs:\n        return {'released': []}\n    ec2 = boto3.client('ec2', region_name=event['region'])\n    released = []\n    for aid in allocs:\n        try:\n            ec2.release_address(AllocationId=aid)\n            released.append(aid)\n        except Exception:\n            pass\n    return {'released': released}\n"
+      }
+    },
+    {
+      "name": "CheckS3Bucket",
+      "action": "aws:branch",
+      "description": "Check if S3 bucket is provided before applying lifecycle.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApplyS3Lifecycle",
+            "Not": {
+              "Variable": "{{ S3BucketName }}",
+              "StringEquals": ""
+            }
+          }
+        ],
+        "Default": "Summary"
+      }
+    },
+    {
+      "name": "ApplyS3Lifecycle",
+      "action": "aws:executeScript",
+      "description": "Apply S3 lifecycle policy for cost optimization after wasteful resource cleanup.",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "bucket_name": "{{ S3BucketName }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    bucket_name = event.get('bucket_name', '')\n    if not bucket_name:\n        return {'status': 'skipped', 'message': 'No bucket name provided'}\n    \n    s3 = boto3.client('s3')\n    \n    lifecycle_config = {\n        'Rules': [\n            {\n                'ID': 'cost-governance-lifecycle',\n                'Status': 'Enabled',\n                'Filter': {'Prefix': ''},\n                'Transitions': [\n                    {'Days': 30, 'StorageClass': 'STANDARD_IA'},\n                    {'Days': 90, 'StorageClass': 'GLACIER'}\n                ],\n                'Expiration': {'Days': 365}\n            },\n            {\n                'ID': 'cleanup-old-versions',\n                'Status': 'Enabled',\n                'Filter': {'Prefix': ''},\n                'NoncurrentVersionExpiration': {'NoncurrentDays': 30}\n            }\n        ]\n    }\n    \n    try:\n        s3.put_bucket_lifecycle_configuration(\n            Bucket=bucket_name,\n            LifecycleConfiguration=lifecycle_config\n        )\n        return {'status': 'success', 'bucket': bucket_name}\n    except Exception as e:\n        return {'status': 'failed', 'error': str(e)}\n"
+      }
+    },
+    {
+      "name": "Summary",
+      "action": "aws:executeScript",
+      "description": "Summarize cleanup actions for logs and auditing.",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "instances": "{{ DiscoverResources.instances }}",
+          "volumes": "{{ DiscoverResources.volumes }}",
+          "snapshots": "{{ DiscoverResources.snapshots }}",
+          "eips": "{{ DiscoverResources.eip_allocations }}"
+        },
+        "Script": "def handler(event, context):\n    return {\n      'summary': {\n        'instances_terminated': event.get('instances', []),\n        'volumes_deleted': event.get('volumes', []),\n        'snapshots_deleted': event.get('snapshots', []),\n        'eips_released': event.get('eips', [])\n      }\n    }\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: #f9f9f9;
+  color: #333;
+}
+
+header {
+  background: #004080;
+  color: white;
+  padding: 20px;
+  text-align: center;
+}
+
+.logo {
+  height: 60px;
+}
+
+main {
+  padding: 20px;
+}
+
+footer {
+  background: #eee;
+  text-align: center;
+  padding: 10px;
+  margin-top: 20px;
+}
+
+/* Highlighted status message */
+.highlight {
+  font-weight: bold;
+  font-size: 1.2em;
+  padding: 10px 15px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  display: inline-block;
+}
+
+/* Expensive storage style */
+.expensive {
+  background-color: #ffe0e0;
+  color: #a94442;
+  border: 1px solid #d9534f;
+}
+
+/* Optimized storage style */
+.optimized {
+  background-color: #e0f7e0;
+  color: #3c763d;
+  border: 1px solid #5cb85c;
+}

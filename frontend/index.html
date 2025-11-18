@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Cost Optimization Demo</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>💸 AWS Cost Governance Demo</h1>
+    <p>Automated Wasteful Resource Detection & Cleanup</p>
+  </header>
+
+  <main>
+    <section>
+      <!-- Dynamic storage status -->
+      <p id="storage-status" class="highlight"></p>
+    </section>
+
+    <section>
+      <h2>Cost Optimization Demo</h2>
+      <p>
+        This simple static website demonstrates the importance of choosing the right storage solution for your workloads.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2025 Cost Governance Demo</p>
+  </footer>
+
+  <script>
+    // Always show warning by default (no lifecycle policies)
+    const lifecycleOptimized = false;
+
+    const statusElement = document.getElementById("storage-status");
+    statusElement.textContent = "⚠️ This static site is stored on expensive storage without lifecycle policies.";
+
+    // Apply CSS classes for styling
+    statusElement.classList.add("highlight");
+    statusElement.classList.add("expensive");
+  </script>
+</body>
+</html>
